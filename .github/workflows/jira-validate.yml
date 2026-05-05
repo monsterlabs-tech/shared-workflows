@@ -1,0 +1,40 @@
+name: JIRA Validate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      title:
+        description: "PR title or commit message to validate"
+        required: true
+        type: string
+      base-branch:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      jira-base-url:
+        required: true
+      jira-user-email:
+        required: true
+      jira-api-token:
+        required: true
+    outputs:
+      jira-ticket:
+        value: ${{ jobs.validate.outputs.jira-ticket }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      jira-ticket: ${{ steps.check.outputs.jira-ticket }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: monsterlabs-tech/shared-workflows/.github/actions/jira-check@v1
+        id: check
+        with:
+          title: ${{ inputs.title }}
+          base-branch: ${{ inputs.base-branch }}
+          jira-base-url: ${{ secrets.jira-base-url }}
+          jira-api-user: ${{ secrets.jira-user-email }}
+          jira-api-token: ${{ secrets.jira-api-token }}

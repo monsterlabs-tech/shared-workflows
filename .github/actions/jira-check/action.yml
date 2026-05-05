@@ -1,0 +1,122 @@
+name: JIRA Ticket Check
+description: Validates that a title contains a valid JIRA ticket and verifies it exists
+
+inputs:
+  title:
+    description: "The PR title or commit message to validate"
+    required: true
+  base-branch:
+    description: "The base branch of the PR (used to determine format rules)"
+    required: false
+    default: ""
+  jira-base-url:
+    description: "JIRA base URL"
+    required: true
+  jira-api-user:
+    description: "JIRA API User email"
+    required: true
+  jira-api-token:
+    description: "JIRA API Token"
+    required: true
+
+outputs:
+  jira-ticket:
+    description: "JIRA ticket ID(s) found in the title"
+    value: ${{ steps.validate.outputs.jira-ticket }}
+
+runs:
+  using: composite
+  steps:
+    - id: validate
+      shell: bash
+      env:
+        TITLE: ${{ inputs.title }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        JIRA_BASE_URL: ${{ inputs.jira-base-url }}
+        JIRA_USER_EMAIL: ${{ inputs.jira-api-user }}
+        JIRA_API_TOKEN: ${{ inputs.jira-api-token }}
+      run: |
+        echo "Checking title: $TITLE"
+        echo "Base branch: ${BASE_BRANCH:-N/A}"
+        echo ""
+
+        VALID_TYPES="feat|feature|fix|breaking|major|minor|patch|chore|docs|refactor|test|style|perf|ci|build|revert"
+        IS_RELEASE=false
+
+        # ── Determine format based on base branch ──
+
+        if [ "$BASE_BRANCH" = "main" ] || [ "$BASE_BRANCH" = "master" ]; then
+          # Release PR to main: require "type: <TICKET-ID> Title"
+          # Also allow "type: Release/..." or "type: Hotfix/..." patterns
+          if echo "$TITLE" | grep -qiE "^($VALID_TYPES): (Release|Hotfix)"; then
+            echo "✅ Release/Hotfix PR detected — skipping ticket validation"
+            IS_RELEASE=true
+          elif echo "$TITLE" | grep -qiE "^(Release|Hotfix)"; then
+            echo "❌ Release/Hotfix PR title must start with a commit type"
+            echo ""
+            echo "Required format for release PRs:"
+            echo "  feat: Release/<description>"
+            echo "  fix: Hotfix/<description>"
+            echo ""
+            echo "The type prefix is required for semantic-release to detect the release."
+            exit 1
+          elif ! echo "$TITLE" | grep -qE "^($VALID_TYPES): [A-Z]+-[0-9]+ .+"; then
+            echo "❌ Invalid PR title format for release to main"
+            echo ""
+            echo "Required format: <type>: <TICKET-ID> <title>"
+            echo ""
+            echo "Examples:"
+            echo "  feat: MXM-1234 Add user authentication"
+            echo "  fix: MXM-5678 Resolve payment timeout"
+            echo "  feat: Release/2026.02.16 rc 10.00"
+            echo "  fix: Hotfix/Fix payment timeout"
+            exit 1
+          fi
+        else
+          # Integration PR to develop or other branches: require "<TICKET-ID> Title"
+          if ! echo "$TITLE" | grep -qE "^[A-Z]+-[0-9]+ .+"; then
+            echo "❌ Invalid PR title format"
+            echo ""
+            echo "Required format: <TICKET-ID> <title>"
+            echo ""
+            echo "Examples:"
+            echo "  MXM-1234 Add user authentication"
+            echo "  MXM-5678 Resolve payment timeout"
+            exit 1
+          fi
+        fi
+
+        # ── Extract and validate JIRA ticket ──
+
+        if [ "$IS_RELEASE" = "true" ]; then
+          echo "jira-ticket=" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        TICKET=$(echo "$TITLE" | grep -oE "[A-Z]+-[0-9]+" | head -1 || true)
+
+        if [ -z "$TICKET" ]; then
+          echo "❌ No JIRA ticket ID found in title"
+          exit 1
+        fi
+
+        echo "Ticket ID: $TICKET"
+
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -u "$JIRA_USER_EMAIL:$JIRA_API_TOKEN" \
+          -H "Content-Type: application/json" \
+          "$JIRA_BASE_URL/rest/api/3/issue/$TICKET")
+
+        if [ "$HTTP_STATUS" = "200" ]; then
+          echo "✅ JIRA ticket $TICKET verified"
+        elif [ "$HTTP_STATUS" = "404" ]; then
+          echo "❌ JIRA ticket $TICKET does not exist"
+          exit 1
+        elif [ "$HTTP_STATUS" = "401" ]; then
+          echo "❌ JIRA authentication failed — check JIRA_API_TOKEN and JIRA_USER_EMAIL secrets"
+          exit 1
+        else
+          echo "⚠️ Could not verify ticket $TICKET (HTTP $HTTP_STATUS) — proceeding anyway"
+        fi
+
+        echo "jira-ticket=$TICKET" >> $GITHUB_OUTPUT

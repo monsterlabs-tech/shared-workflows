@@ -1,0 +1,84 @@
+name: Terraform Plan (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: "Stack directory (e.g. network, ecs-platform)"
+        required: true
+        type: string
+      environment:
+        description: "Environment name matching environments/<env>/ (e.g. maxim-dev)"
+        required: true
+        type: string
+      aws-region:
+        required: true
+        type: string
+      role-to-assume:
+        description: "Plan role ARN for this account"
+        required: true
+        type: string
+      terraform-version:
+        required: false
+        type: string
+        default: "1.10.0"
+      working-directory-prefix:
+        description: "Prefix in front of <stack> (default: repo root)"
+        required: false
+        type: string
+        default: "."
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory-prefix }}/${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Terraform init
+        run: terraform init -reconfigure -backend-config=environments/${{ inputs.environment }}/backend.hcl
+
+      - name: Terraform plan
+        id: plan
+        run: terraform plan -var-file=environments/${{ inputs.environment }}/terraform.tfvars -no-color
+        continue-on-error: true
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN: ${{ steps.plan.outputs.stdout }}
+          STACK: ${{ inputs.stack }}
+          ENV: ${{ inputs.environment }}
+        with:
+          script: |
+            const max = 60000;
+            let plan = process.env.PLAN || '(no output)';
+            if (plan.length > max) plan = plan.slice(0, max) + '\n...[truncated]';
+            const body = `### \`${process.env.STACK}\` - ${process.env.ENV} plan\n\`\`\`hcl\n${plan}\n\`\`\``;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

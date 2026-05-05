@@ -1,0 +1,88 @@
+name: ECS Deploy (reusable)
+
+# Replaces the legacy SSH-to-EC2 + docker-compose pull/up pattern.
+# Renders the live task definition with a new image and updates the ECS
+# service via AWS OIDC. No long-lived SSH keys, no static .env on hosts.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev | prod (used for naming + GH environment gate)"
+        required: true
+        type: string
+      aws-region:
+        required: true
+        type: string
+      role-to-assume:
+        description: "Deploy role ARN (per-account) for ecs:UpdateService + iam:PassRole"
+        required: true
+        type: string
+      cluster:
+        description: "ECS cluster name (e.g. maxim-dev-platform)"
+        required: true
+        type: string
+      service:
+        description: "ECS service name"
+        required: true
+        type: string
+      task-definition:
+        description: "Task definition family name"
+        required: true
+        type: string
+      container-name:
+        description: "Container name within the task definition to update"
+        required: true
+        type: string
+      image:
+        description: "Fully qualified image to deploy (e.g. ghcr.io/owner/repo:sha-...)"
+        required: true
+        type: string
+      wait-for-stable:
+        required: false
+        type: boolean
+        default: true
+      gh-environment:
+        description: "GitHub Environment name for protection rules. Defaults to inputs.environment."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.gh-environment != '' && inputs.gh-environment || inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ inputs.task-definition }} \
+            --query 'taskDefinition' \
+            > task-definition.json
+
+      - name: Update image in task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ inputs.container-name }}
+          image: ${{ inputs.image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ inputs.service }}
+          cluster: ${{ inputs.cluster }}
+          wait-for-service-stability: ${{ inputs.wait-for-stable }}
