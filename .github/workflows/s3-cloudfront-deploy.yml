@@ -1,0 +1,101 @@
+name: S3 + CloudFront Deploy (reusable)
+
+# Replaces ecs-deploy.yml for static-site frontends.
+# Steps:
+#   1. Sync built artifacts to S3 with cache-control headers tuned per file type
+#   2. Create CloudFront invalidation for /* (SPA - everything is short-lived)
+#   3. Wait for invalidation to complete (so the URL serves new content
+#      before the workflow reports success)
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "dev | prod (also drives the GitHub Environment gate)"
+        required: true
+        type: string
+      aws-region:
+        required: true
+        type: string
+      role-to-assume:
+        description: "Deploy role ARN with s3:* on the bucket + cloudfront:CreateInvalidation"
+        required: true
+        type: string
+      bucket:
+        description: "Target S3 bucket (output from frontend Terraform stack)"
+        required: true
+        type: string
+      distribution-id:
+        description: "CloudFront distribution ID (output from frontend Terraform stack)"
+        required: true
+        type: string
+      source-dir:
+        description: "Local directory holding the built artifacts (default: dist)"
+        required: false
+        type: string
+        default: "dist"
+      gh-environment:
+        required: false
+        type: string
+        default: ""
+      wait-for-invalidation:
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.gh-environment != '' && inputs.gh-environment || inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: ${{ inputs.source-dir }}
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Sync hashed assets (long cache)
+        run: |
+          aws s3 sync "${{ inputs.source-dir }}/" "s3://${{ inputs.bucket }}/" \
+            --exclude "*" \
+            --include "assets/*" \
+            --include "*.js" --include "*.css" --include "*.woff2" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --no-progress
+
+      - name: Sync HTML + manifests (no cache)
+        run: |
+          aws s3 sync "${{ inputs.source-dir }}/" "s3://${{ inputs.bucket }}/" \
+            --exclude "assets/*" \
+            --exclude "*.js" --exclude "*.css" --exclude "*.woff2" \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --delete \
+            --no-progress
+
+      - name: Invalidate CloudFront
+        id: invalidate
+        run: |
+          ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${{ inputs.distribution-id }}" \
+            --paths "/*" \
+            --query 'Invalidation.Id' --output text)
+          echo "id=$ID" >> "$GITHUB_OUTPUT"
+          echo "Created invalidation: $ID"
+
+      - name: Wait for invalidation
+        if: ${{ inputs.wait-for-invalidation }}
+        run: |
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "${{ inputs.distribution-id }}" \
+            --id "${{ steps.invalidate.outputs.id }}"
