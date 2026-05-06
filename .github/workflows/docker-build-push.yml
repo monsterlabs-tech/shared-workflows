@@ -30,9 +30,13 @@ on:
         type: string
         default: ""
       runs-on:
+        description: |
+          JSON array of runner labels.
+          Single label:  '["ubuntu-latest"]'
+          Multi label:   '["self-hosted", "maxim"]'
         required: false
         type: string
-        default: "ubuntu-latest"
+        default: '["ubuntu-latest"]'
     outputs:
       image-ref:
         description: "Fully qualified image reference (registry/owner/image:tag)"
@@ -50,7 +54,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ inputs.runs-on }}
+    runs-on: ${{ fromJSON(inputs.runs-on) }}
     outputs:
       image-ref: ${{ steps.ref.outputs.image-ref }}
       digest: ${{ steps.build.outputs.digest }}
