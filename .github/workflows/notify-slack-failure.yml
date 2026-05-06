@@ -1,0 +1,69 @@
+name: Notify Slack on failure (reusable)
+
+# Posts a message to Slack when a calling workflow's job fails.
+# Caller pattern:
+#
+#   notify-failure:
+#     if: ${{ always() && contains(needs.*.result, 'failure') }}
+#     needs: [test, build-dev, deploy-dev]
+#     uses: monsterlabs-tech/shared-workflows/.github/workflows/notify-slack-failure.yml@v1
+#     with:
+#       workflow: ${{ github.workflow }}
+#       run-url:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+#       branch:   ${{ github.ref_name }}
+#       repo:     ${{ github.repository }}
+#     secrets:
+#       slack-webhook-url: ${{ secrets.SLACK_CICD_WEBHOOK_URL }}
+#
+# Requires the org-level secret `SLACK_CICD_WEBHOOK_URL` (Slack incoming webhook
+# pointing at the CI/CD channel).
+
+on:
+  workflow_call:
+    inputs:
+      workflow:
+        required: true
+        type: string
+      run-url:
+        required: true
+        type: string
+      branch:
+        required: true
+        type: string
+      repo:
+        required: true
+        type: string
+    secrets:
+      slack-webhook-url:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Slack
+        run: |
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            --data "$(cat <<JSON
+          {
+            "text": ":x: *${{ inputs.workflow }}* failed",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":x: *${{ inputs.workflow }}* failed in *${{ inputs.repo }}*"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Branch*\n${{ inputs.branch }}" },
+                  { "type": "mrkdwn", "text": "*Run*\n<${{ inputs.run-url }}|View logs>" }
+                ]
+              }
+            ]
+          }
+          JSON
+          )" \
+            "${{ secrets.slack-webhook-url }}"
