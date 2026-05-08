@@ -44,8 +44,12 @@ on:
       digest:
         value: ${{ jobs.build.outputs.digest }}
     secrets:
-      ghcr-token:
-        description: "Token with write:packages on monsterlabs-tech. Defaults to GITHUB_TOKEN."
+      ghcr-read-token:
+        description: |
+          Token with read:packages on monsterlabs-tech. Used to compose .npmrc
+          for cross-repo @monsterlabs-tech/* package installs inside the Docker
+          build. Image push to GHCR uses the workflow's GITHUB_TOKEN with the
+          calling job's `permissions: packages: write`.
         required: false
 
 permissions:
@@ -63,17 +67,22 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
+      # Image push: use the workflow's GITHUB_TOKEN. The calling job has
+      # `permissions: packages: write`, which gives GITHUB_TOKEN write access
+      # to THIS repo's GHCR packages - which is what we push.
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.ghcr-token || secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Build-time npm install: needs read:packages for OTHER @monsterlabs-tech
+      # packages (eslint-config, models). Caller passes a low-scope read token.
       - name: Compose .npmrc for build-time GitHub Packages auth
         run: |
           cat > /tmp/build-npmrc <<EOF
           @monsterlabs-tech:registry=https://npm.pkg.github.com
-          //npm.pkg.github.com/:_authToken=${{ secrets.ghcr-token || secrets.GITHUB_TOKEN }}
+          //npm.pkg.github.com/:_authToken=${{ secrets.ghcr-read-token || secrets.GITHUB_TOKEN }}
           EOF
 
       - name: Extract metadata
