@@ -69,6 +69,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.ghcr-token || secrets.GITHUB_TOKEN }}
 
+      - name: Compose .npmrc for build-time GitHub Packages auth
+        run: |
+          cat > /tmp/build-npmrc <<EOF
+          @monsterlabs-tech:registry=https://npm.pkg.github.com
+          //npm.pkg.github.com/:_authToken=${{ secrets.ghcr-token || secrets.GITHUB_TOKEN }}
+          EOF
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -92,6 +99,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: ${{ inputs.build-args }}
+          # Mount .npmrc as a BuildKit secret. Dockerfiles that need to
+          # install from @monsterlabs-tech use:
+          #   RUN --mount=type=secret,id=npmrc,target=/root/.npmrc npm install
+          # The secret is only mounted for that RUN; never written to a layer.
+          secret-files: |
+            npmrc=/tmp/build-npmrc
 
       - name: Resolve image-ref
         id: ref
