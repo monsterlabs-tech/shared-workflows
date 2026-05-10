@@ -1,0 +1,114 @@
+name: Security
+
+# Reusable security workflow. Two jobs:
+# - dependency-audit: npm audit on production deps; fails the run on any
+#   critical vulnerability, warns on high (continue-on-error so a high CVE
+#   does not block routine PRs but is visible in run summary).
+# - secret-scanning: gitleaks across full history.
+#
+# Usage from a consumer repo (.github/workflows/ci-cd.yml):
+#   security:
+#     uses: monsterlabs-tech/shared-workflows/.github/workflows/security.yml@v1
+#     secrets:
+#       npmrc: ${{ secrets.NPMRC }}
+#       gitleaks-license: ${{ secrets.GITLEAKS_LICENSE }}
+#
+# Add a weekly schedule per-repo (cron is not allowed in reusable workflows
+# called via workflow_call, so each repo wraps it in its own scheduled
+# wrapper if a regular sweep is desired).
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node major.minor.patch used for the audit step
+        type: string
+        default: '22.14.0'
+      skip-dependency-audit:
+        description: Set true for repos without a package.json (terraform-only, docs-only)
+        type: boolean
+        default: false
+      skip-secret-scanning:
+        description: Set true to disable gitleaks (avoid except for emergencies)
+        type: boolean
+        default: false
+    secrets:
+      ghcr-read-token:
+        description: PAT with read:packages scope for @monsterlabs-tech private deps. Required when the repo consumes private packages and skip-dependency-audit is false.
+        required: false
+      gitleaks-license:
+        description: Gitleaks Pro license key (org-level secret). Falls back to OSS scanner if absent.
+        required: false
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  dependency-audit:
+    name: Dependency Audit
+    if: ${{ !inputs.skip-dependency-audit }}
+    runs-on: [self-hosted, maxim]
+    steps:
+      - name: Clean up stale git locks
+        run: find . -name "*.lock" -type f -delete 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+        with:
+          clean: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - name: Configure npm for GitHub Packages
+        env:
+          GHCR_READ_TOKEN: ${{ secrets.ghcr-read-token }}
+        run: |
+          if [ -n "$GHCR_READ_TOKEN" ]; then
+            cat > .npmrc <<EOF
+          @monsterlabs-tech:registry=https://npm.pkg.github.com
+          //npm.pkg.github.com/:_authToken=$GHCR_READ_TOKEN
+          EOF
+          fi
+
+      - name: Clean node_modules
+        run: rm -rf node_modules
+
+      - name: Install dependencies
+        run: npm ci --omit=dev --ignore-scripts
+
+      - name: Run npm audit (high+critical)
+        run: npm audit --omit=dev --audit-level=high
+        continue-on-error: true
+
+      - name: Fail on critical vulnerabilities
+        run: |
+          CRITICAL=$(npm audit --omit=dev --json 2>/dev/null | jq '.metadata.vulnerabilities.critical // 0')
+          HIGH=$(npm audit --omit=dev --json 2>/dev/null | jq '.metadata.vulnerabilities.high // 0')
+          echo "Critical: $CRITICAL, High: $HIGH"
+          if [ "$CRITICAL" -gt 0 ]; then
+            echo "::error::Critical vulnerabilities found in production dependencies"
+            exit 1
+          fi
+
+  secret-scanning:
+    name: Secret Scanning
+    if: ${{ !inputs.skip-secret-scanning }}
+    runs-on: [self-hosted, maxim]
+    steps:
+      - name: Clean up stale git locks
+        run: find . -name "*.lock" -type f -delete 2>/dev/null || true
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          clean: true
+
+      - name: Gitleaks Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_LICENSE: ${{ secrets.gitleaks-license }}
