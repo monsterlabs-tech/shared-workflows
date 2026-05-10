@@ -58,7 +58,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          cache: npm
+          # Intentionally no `cache: npm` - that requires package-lock.json,
+          # which some service repos don't ship. The audit job tolerates both.
 
       - name: Configure npm for GitHub Packages
         env:
@@ -75,7 +76,10 @@ jobs:
         run: rm -rf node_modules
 
       - name: Install dependencies
-        run: npm ci --omit=dev --ignore-scripts
+        # npm install rather than npm ci so we work with or without a
+        # package-lock.json. --ignore-scripts skips lifecycle hooks
+        # (prepare/build); we only need the dep tree for audit.
+        run: npm install --omit=dev --ignore-scripts --no-audit --no-fund
 
       - name: Run npm audit (high+critical)
         run: npm audit --omit=dev --audit-level=high
