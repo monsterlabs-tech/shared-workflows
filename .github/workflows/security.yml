@@ -1,21 +1,20 @@
 name: Security
 
 # Reusable security workflow. Two jobs:
-# - dependency-audit: npm audit on production deps; fails the run on any
-#   critical vulnerability, warns on high (continue-on-error so a high CVE
-#   does not block routine PRs but is visible in run summary).
-# - secret-scanning: gitleaks across full history.
+# - dependency-audit: npm install (prod deps only, --ignore-scripts), then
+#   npm audit; fails on any critical vulnerability, warns on high.
+# - secret-scanning: gitleaks CLI across full history; fails on any leak.
 #
-# Usage from a consumer repo (.github/workflows/ci-cd.yml):
-#   security:
-#     uses: monsterlabs-tech/shared-workflows/.github/workflows/security.yml@v1
-#     secrets:
-#       npmrc: ${{ secrets.NPMRC }}
-#       gitleaks-license: ${{ secrets.GITLEAKS_LICENSE }}
+# Usage from a consumer repo (.github/workflows/security.yml):
+#   jobs:
+#     security:
+#       uses: monsterlabs-tech/shared-workflows/.github/workflows/security.yml@v1
+#       secrets: inherit
 #
-# Add a weekly schedule per-repo (cron is not allowed in reusable workflows
-# called via workflow_call, so each repo wraps it in its own scheduled
-# wrapper if a regular sweep is desired).
+# `secrets: inherit` forwards the caller's org/repo secrets by their
+# original name. This workflow reads GHCR_READ_TOKEN directly (uppercase,
+# matching the org-secret convention). If the caller uses an explicit
+# `secrets:` block instead of inherit, they MUST forward GHCR_READ_TOKEN.
 
 on:
   workflow_call:
@@ -32,10 +31,6 @@ on:
         description: Set true to disable gitleaks (avoid except for emergencies)
         type: boolean
         default: false
-    secrets:
-      ghcr-read-token:
-        description: PAT with read:packages scope for @monsterlabs-tech private deps. Required when the repo consumes private packages and skip-dependency-audit is false.
-        required: false
 
 permissions:
   contents: read
@@ -58,12 +53,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
-          # Intentionally no `cache: npm` - that requires package-lock.json,
-          # which some service repos don't ship. The audit job tolerates both.
+          # No `cache: npm` - requires package-lock.json, which some service
+          # repos don't ship. The audit job tolerates both.
 
       - name: Configure npm for GitHub Packages
+        # Reads GHCR_READ_TOKEN from the caller (forwarded via secrets: inherit).
+        # If empty, the .npmrc is not written; only repos with no private deps
+        # will succeed in that mode.
         env:
-          GHCR_READ_TOKEN: ${{ secrets.ghcr-read-token }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
         run: |
           if [ -n "$GHCR_READ_TOKEN" ]; then
             cat > .npmrc <<EOF
