@@ -110,8 +110,10 @@ jobs:
       - name: Clean stale gitleaks scratch files
         # Self-hosted runners persist /tmp between jobs. The gitleaks-action
         # download step refuses to overwrite, so a leftover /tmp/gitleaks.tmp
-        # from a prior run kills the install. Wipe before we start.
-        run: rm -f /tmp/gitleaks.tmp /tmp/gitleaks-*
+        # or /tmp/gitleaks-<version>/ directory from a prior run kills the
+        # install. Wipe before we start. Use -rf because the version dir is
+        # a directory, not a file.
+        run: rm -rf /tmp/gitleaks.tmp /tmp/gitleaks-*
 
       - name: Gitleaks Scan
         uses: gitleaks/gitleaks-action@v2
