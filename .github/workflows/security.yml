@@ -36,9 +36,6 @@ on:
       ghcr-read-token:
         description: PAT with read:packages scope for @monsterlabs-tech private deps. Required when the repo consumes private packages and skip-dependency-audit is false.
         required: false
-      gitleaks-license:
-        description: Gitleaks Pro license key (org-level secret). Falls back to OSS scanner if absent.
-        required: false
 
 permissions:
   contents: read
@@ -107,16 +104,19 @@ jobs:
           fetch-depth: 0
           clean: true
 
-      - name: Clean stale gitleaks scratch files
-        # Self-hosted runners persist /tmp between jobs. The gitleaks-action
-        # download step refuses to overwrite, so a leftover /tmp/gitleaks.tmp
-        # or /tmp/gitleaks-<version>/ directory from a prior run kills the
-        # install. Wipe before we start. Use -rf because the version dir is
-        # a directory, not a file.
-        run: rm -rf /tmp/gitleaks.tmp /tmp/gitleaks-*
+      # Run the gitleaks binary directly rather than gitleaks/gitleaks-action.
+      # The action requires a license for org-owned repos and has unreliable
+      # self-hosted-runner cleanup. The CLI is unrestricted and predictable.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.0
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/gitleaks-install && mkdir -p /tmp/gitleaks-install
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /tmp/gitleaks-install
+          sudo mv /tmp/gitleaks-install/gitleaks /usr/local/bin/gitleaks
+          gitleaks version
 
       - name: Gitleaks Scan
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GITLEAKS_LICENSE: ${{ secrets.gitleaks-license }}
+        run: gitleaks detect --source . --redact --no-banner --exit-code 1
