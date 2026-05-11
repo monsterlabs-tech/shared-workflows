@@ -1,0 +1,184 @@
+name: Terraform Drift Detection (reusable)
+
+# Runs `terraform plan -detailed-exitcode` against a stack and posts to Slack
+# if drift is detected (exit code 2) or if the plan errors (exit code 1).
+#
+# Designed for scheduled use. The workflow itself always succeeds when drift
+# is found (so the schedule stays armed); the noise channel for the actual
+# drift signal is Slack + the workflow summary.
+#
+# Caller pattern (from monsterlabs-tech/devops/.github/workflows/drift.yml):
+#
+#   jobs:
+#     foundations-dev:
+#       uses: monsterlabs-tech/shared-workflows/.github/workflows/terraform-drift.yml@v1
+#       with:
+#         stack: account-foundations
+#         environment: maxim-dev
+#         aws-region: eu-west-2
+#         role-to-assume: arn:aws:iam::<dev-acct>:role/<plan-role>
+#       secrets: inherit
+#
+# Required secret (inherited from org/repo): SLACK_CICD_WEBHOOK_URL
+
+on:
+  workflow_call:
+    inputs:
+      stack:
+        description: "Stack directory (e.g. network, ecs-platform)"
+        required: true
+        type: string
+      environment:
+        description: "Environment name matching environments/<env>/ (e.g. maxim-dev)"
+        required: true
+        type: string
+      aws-region:
+        required: true
+        type: string
+      role-to-assume:
+        description: "Plan role ARN for this account. Must trust monsterlabs-tech/devops via OIDC."
+        required: true
+        type: string
+      terraform-version:
+        required: false
+        type: string
+        default: "1.10.0"
+      slack-channel-label:
+        description: "Human label appearing in the Slack message (e.g. #ops)"
+        required: false
+        type: string
+        default: "#ops"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.stack }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ inputs.role-to-assume }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Terraform init
+        run: terraform init -reconfigure -backend-config=environments/${{ inputs.environment }}/backend.hcl
+
+      - name: Terraform plan (detailed-exitcode)
+        id: plan
+        # -lock=false: drift detection should never block on a concurrent
+        # apply's state lock; we're read-only.
+        # -no-color: log readability + Slack message safety.
+        # Exit code semantics: 0=clean, 1=error, 2=diff (= drift).
+        # `|| true` to capture the exit code rather than failing the step.
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -lock=false -no-color \
+            -var-file=environments/${{ inputs.environment }}/terraform.tfvars \
+            > plan.out 2>&1
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          # Always print the plan to the job log for debugging.
+          cat plan.out
+
+      - name: Summarise outcome
+        id: summary
+        run: |
+          case "${{ steps.plan.outputs.exit_code }}" in
+            0) echo "status=clean" >> "$GITHUB_OUTPUT"; echo "::notice::No drift detected" ;;
+            2) echo "status=drift" >> "$GITHUB_OUTPUT"; echo "::warning::Drift detected" ;;
+            *) echo "status=error" >> "$GITHUB_OUTPUT"; echo "::error::Plan errored" ;;
+          esac
+
+      - name: Truncate plan output for Slack
+        if: steps.summary.outputs.status != 'clean'
+        run: |
+          # Slack message JSON is capped; keep the diff under ~2500 chars.
+          # Show the last 2500 chars - the plan's tail has the resource diffs.
+          tail -c 2500 plan.out > plan.tail
+          # Escape for safe embedding in JSON.
+          jq -Rs '.' plan.tail > plan.json
+          echo "PLAN_JSON_FILE=plan.json" >> "$GITHUB_ENV"
+
+      - name: Post drift to Slack
+        if: steps.summary.outputs.status == 'drift'
+        env:
+          WEBHOOK: ${{ secrets.SLACK_CICD_WEBHOOK_URL }}
+        run: |
+          PLAN_TAIL=$(cat plan.json)
+          cat > slack-payload.json <<JSON
+          {
+            "text": ":warning: Terraform drift detected: ${{ inputs.stack }} / ${{ inputs.environment }}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":warning: *Drift detected* in \`${{ inputs.stack }}\` (\`${{ inputs.environment }}\`)"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Repo*\n${{ github.repository }}" },
+                  { "type": "mrkdwn", "text": "*Run*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>" }
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Plan tail* (last 2500 chars):\n\`\`\`\n$(jq -r '.' plan.json | sed 's/`/`/g')\n\`\`\`"
+                }
+              }
+            ]
+          }
+          JSON
+          curl -sS -X POST -H 'Content-Type: application/json' --data @slack-payload.json "$WEBHOOK"
+
+      - name: Post error to Slack
+        if: steps.summary.outputs.status == 'error'
+        env:
+          WEBHOOK: ${{ secrets.SLACK_CICD_WEBHOOK_URL }}
+        run: |
+          cat > slack-payload.json <<JSON
+          {
+            "text": ":x: Drift check errored: ${{ inputs.stack }} / ${{ inputs.environment }}",
+            "blocks": [
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": ":x: *Drift check errored* for \`${{ inputs.stack }}\` (\`${{ inputs.environment }}\`) - plan did not complete"
+                }
+              },
+              {
+                "type": "section",
+                "fields": [
+                  { "type": "mrkdwn", "text": "*Repo*\n${{ github.repository }}" },
+                  { "type": "mrkdwn", "text": "*Run*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>" }
+                ]
+              },
+              {
+                "type": "section",
+                "text": {
+                  "type": "mrkdwn",
+                  "text": "*Plan tail* (last 2500 chars):\n\`\`\`\n$(jq -r '.' plan.json | sed 's/`/`/g')\n\`\`\`"
+                }
+              }
+            ]
+          }
+          JSON
+          curl -sS -X POST -H 'Content-Type: application/json' --data @slack-payload.json "$WEBHOOK"
+          # Drift-errors are real failures; fail the job so the schedule run is red.
+          exit 1
