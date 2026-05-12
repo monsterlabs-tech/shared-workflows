@@ -1,0 +1,43 @@
+# =============================================================================
+# Dependabot policy: SECURITY UPDATES ONLY (no version updates)
+# =============================================================================
+# This file deliberately sets `open-pull-requests-limit: 0` for every
+# ecosystem. That kills Dependabot's "newer version available" PRs.
+#
+# Security advisory PRs are unaffected by this limit (per GitHub docs) and
+# fire automatically when a CVE is published against one of our pinned
+# dependencies, PROVIDED the repo has "Dependabot security updates" enabled
+# under Settings -> Code security. That toggle is managed at the org level
+# via gh api; do not flip it manually per-repo.
+#
+# Why this stance:
+# - We are pre-launch (UK MVP 2026-06-30) and value stability over freshness.
+# - Routine patch/minor bumps create CI churn without a security justification.
+# - When we have headcount to evaluate upgrades against a known baseline,
+#   we will run a deliberate quarterly review (not a constant PR stream).
+#
+# Policy doc: docs/dependency-update-policy.md in monsterlabs-tech/devops.
+#
+# To re-enable scheduled version updates in this repo (e.g. for a deliberate
+# upgrade window), raise the limit and the schedule below per ecosystem.
+# =============================================================================
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
