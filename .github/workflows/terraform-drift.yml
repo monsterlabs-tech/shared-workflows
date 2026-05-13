@@ -5,7 +5,7 @@ name: Terraform Drift Detection (reusable)
 #
 # Designed for scheduled use. The workflow itself always succeeds when drift
 # is found (so the schedule stays armed); the noise channel for the actual
-# drift signal is Slack + the workflow summary.
+# drift signal is Slack + the workflow summary. Plan errors fail the job.
 #
 # Caller pattern (from monsterlabs-tech/devops/.github/workflows/drift.yml):
 #
@@ -17,9 +17,12 @@ name: Terraform Drift Detection (reusable)
 #         environment: maxim-dev
 #         aws-region: eu-west-2
 #         role-to-assume: arn:aws:iam::<dev-acct>:role/<plan-role>
+#         slack-channel-id: C0B3JLA7B6D  # #cicd
 #       secrets: inherit
 #
-# Required secret (inherited from org/repo): SLACK_CICD_WEBHOOK_URL
+# Required org secret (read via secrets: inherit):
+#   SLACK_BOT_TOKEN  - xoxb-... bot token with chat:write scope.
+#                      The bot must be a member of the target channel.
 
 on:
   workflow_call:
@@ -39,15 +42,14 @@ on:
         description: "Plan role ARN for this account. Must trust monsterlabs-tech/devops via OIDC."
         required: true
         type: string
+      slack-channel-id:
+        description: "Slack channel ID (e.g. C0B3JLA7B6D for #cicd). The bot must be a member of this channel."
+        required: true
+        type: string
       terraform-version:
         required: false
         type: string
         default: "1.10.0"
-      slack-channel-label:
-        description: "Human label appearing in the Slack message (e.g. #ops)"
-        required: false
-        type: string
-        default: "#ops"
 
 permissions:
   id-token: write
@@ -77,18 +79,16 @@ jobs:
 
       - name: Terraform plan (detailed-exitcode)
         id: plan
-        # -lock=false: drift detection should never block on a concurrent
-        # apply's state lock; we're read-only.
+        # -lock=false: drift detection is read-only; never block on a
+        # concurrent apply's state lock.
         # -no-color: log readability + Slack message safety.
         # Exit code semantics: 0=clean, 1=error, 2=diff (= drift).
-        # `|| true` to capture the exit code rather than failing the step.
         run: |
           set +e
           terraform plan -detailed-exitcode -lock=false -no-color \
             -var-file=environments/${{ inputs.environment }}/terraform.tfvars \
             > plan.out 2>&1
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          # Always print the plan to the job log for debugging.
           cat plan.out
 
       - name: Summarise outcome
@@ -100,85 +100,73 @@ jobs:
             *) echo "status=error" >> "$GITHUB_OUTPUT"; echo "::error::Plan errored" ;;
           esac
 
-      - name: Truncate plan output for Slack
+      - name: Post to Slack
         if: steps.summary.outputs.status != 'clean'
-        run: |
-          # Slack message JSON is capped; keep the diff under ~2500 chars.
-          # Show the last 2500 chars - the plan's tail has the resource diffs.
-          tail -c 2500 plan.out > plan.tail
-          # Escape for safe embedding in JSON.
-          jq -Rs '.' plan.tail > plan.json
-          echo "PLAN_JSON_FILE=plan.json" >> "$GITHUB_ENV"
-
-      - name: Post drift to Slack
-        if: steps.summary.outputs.status == 'drift'
         env:
-          WEBHOOK: ${{ secrets.SLACK_CICD_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          CHANNEL: ${{ inputs.slack-channel-id }}
+          STATUS: ${{ steps.summary.outputs.status }}
+          STACK: ${{ inputs.stack }}
+          ENV: ${{ inputs.environment }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          PLAN_TAIL=$(cat plan.json)
-          cat > slack-payload.json <<JSON
-          {
-            "text": ":warning: Terraform drift detected: ${{ inputs.stack }} / ${{ inputs.environment }}",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":warning: *Drift detected* in \`${{ inputs.stack }}\` (\`${{ inputs.environment }}\`)"
-                }
-              },
-              {
-                "type": "section",
-                "fields": [
-                  { "type": "mrkdwn", "text": "*Repo*\n${{ github.repository }}" },
-                  { "type": "mrkdwn", "text": "*Run*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>" }
-                ]
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Plan tail* (last 2500 chars):\n\`\`\`\n$(jq -r '.' plan.json | sed 's/`/`/g')\n\`\`\`"
-                }
-              }
-            ]
-          }
-          JSON
-          curl -sS -X POST -H 'Content-Type: application/json' --data @slack-payload.json "$WEBHOOK"
+          set -euo pipefail
+          # Truncate the plan tail to ~2500 chars - Slack message limit is
+          # ~3000 chars per block. The tail has the resource diffs.
+          PLAN_TAIL=$(tail -c 2500 plan.out)
 
-      - name: Post error to Slack
+          if [ "$STATUS" = "drift" ]; then
+            HEADER=":warning: *Drift detected* in \`${STACK}\` (\`${ENV}\`)"
+            FALLBACK=":warning: Terraform drift detected: ${STACK} / ${ENV}"
+          else
+            HEADER=":x: *Drift check errored* for \`${STACK}\` (\`${ENV}\`) - plan did not complete"
+            FALLBACK=":x: Drift check errored: ${STACK} / ${ENV}"
+          fi
+
+          # Build JSON safely with jq so the plan tail (which may contain
+          # backticks, quotes, backslashes) doesn't break the payload.
+          jq -n \
+            --arg channel "$CHANNEL" \
+            --arg fallback "$FALLBACK" \
+            --arg header "$HEADER" \
+            --arg repo "$REPO" \
+            --arg run_url "$RUN_URL" \
+            --arg plan_tail "$PLAN_TAIL" \
+            '{
+              channel: $channel,
+              text: $fallback,
+              blocks: [
+                { type: "section", text: { type: "mrkdwn", text: $header } },
+                { type: "section", fields: [
+                    { type: "mrkdwn", text: "*Repo*\n\($repo)" },
+                    { type: "mrkdwn", text: "*Run*\n<\($run_url)|View logs>" }
+                  ]
+                },
+                { type: "section", text: { type: "mrkdwn",
+                    text: "*Plan tail* (last 2500 chars):\n```\n\($plan_tail)\n```"
+                  }
+                }
+              ]
+            }' > slack-payload.json
+
+          RESPONSE=$(curl -sS -X POST \
+            -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+            -H "Content-Type: application/json; charset=utf-8" \
+            --data @slack-payload.json \
+            "https://slack.com/api/chat.postMessage")
+          echo "Slack API response: $RESPONSE"
+          # Slack returns {"ok": true} on success. Fail loudly on error so
+          # we surface bot-token / channel-membership issues immediately.
+          OK=$(echo "$RESPONSE" | jq -r '.ok')
+          if [ "$OK" != "true" ]; then
+            ERR=$(echo "$RESPONSE" | jq -r '.error // "unknown"')
+            echo "::error::Slack post failed: $ERR"
+            exit 1
+          fi
+
+      - name: Fail job on plan error
         if: steps.summary.outputs.status == 'error'
-        env:
-          WEBHOOK: ${{ secrets.SLACK_CICD_WEBHOOK_URL }}
-        run: |
-          cat > slack-payload.json <<JSON
-          {
-            "text": ":x: Drift check errored: ${{ inputs.stack }} / ${{ inputs.environment }}",
-            "blocks": [
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": ":x: *Drift check errored* for \`${{ inputs.stack }}\` (\`${{ inputs.environment }}\`) - plan did not complete"
-                }
-              },
-              {
-                "type": "section",
-                "fields": [
-                  { "type": "mrkdwn", "text": "*Repo*\n${{ github.repository }}" },
-                  { "type": "mrkdwn", "text": "*Run*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View logs>" }
-                ]
-              },
-              {
-                "type": "section",
-                "text": {
-                  "type": "mrkdwn",
-                  "text": "*Plan tail* (last 2500 chars):\n\`\`\`\n$(jq -r '.' plan.json | sed 's/`/`/g')\n\`\`\`"
-                }
-              }
-            ]
-          }
-          JSON
-          curl -sS -X POST -H 'Content-Type: application/json' --data @slack-payload.json "$WEBHOOK"
-          # Drift-errors are real failures; fail the job so the schedule run is red.
-          exit 1
+        # Drift (exit 2) is informational and stays green. Plan errors (exit 1)
+        # are real failures and must surface in the Actions UI.
+        run: exit 1
