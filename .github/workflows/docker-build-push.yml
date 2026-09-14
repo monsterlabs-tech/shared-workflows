@@ -39,7 +39,12 @@ on:
         default: '["ubuntu-latest"]'
     outputs:
       image-ref:
-        description: "Fully qualified image reference (registry/owner/image:tag)"
+        description: |
+          Fully qualified IMMUTABLE image reference. Resolves to
+          ghcr.io/<owner>/<image>:<tag> when the `tag` input is set, otherwise
+          to the :sha-<commit> tag. Never a branch (:main, :develop) or PR tag,
+          so it is safe to deploy directly. Fails the build if neither is
+          available rather than falling back to something floating.
         value: ${{ jobs.build.outputs.image-ref }}
       digest:
         value: ${{ jobs.build.outputs.digest }}
@@ -119,8 +124,44 @@ jobs:
         id: ref
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          IMAGE: ghcr.io/${{ github.repository_owner }}/${{ inputs.image }}
+          WANT_TAG: ${{ inputs.tag }}
+          DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          # First tag in the metadata-action output is the canonical reference.
-          IMAGE_REF=$(echo "$TAGS" | head -n1)
+          set -euo pipefail
+
+          # image-ref must be an IMMUTABLE reference.
+          #
+          # This used to be `head -n1` of the metadata-action tag list, on the
+          # assumption that the first tag is canonical. It is not: the list also
+          # carries the branch tag (:main, :develop) and PR tags, and the order
+          # is not a documented contract. On a push to main the branch tag came
+          # first, so callers deployed :main - a floating tag whose contents can
+          # change under a running service on any task restart. That put UK prod
+          # auth-api and office-auth-api on :main and :develop; caught 2026-09-14.
+          #
+          # Resolve deliberately instead: the caller's explicit tag if given,
+          # otherwise the immutable commit-sha tag. Never a branch or PR tag.
+          if [ -n "$WANT_TAG" ]; then
+            IMAGE_REF="$IMAGE:$WANT_TAG"
+          else
+            IMAGE_REF=$(printf '%s\n' "$TAGS" | grep -E ':sha-[0-9a-f]{40}$' | head -n1 || true)
+          fi
+
+          if [ -z "$IMAGE_REF" ]; then
+            echo "::error::cannot resolve an immutable image-ref. Pass the 'tag' input, or ensure type=sha is in the metadata tags. Tags were:"
+            printf '%s\n' "$TAGS"
+            exit 1
+          fi
+
+          # Never hand back a reference that was not actually pushed - a typo in
+          # `tag` would otherwise surface as a deploy-time image pull failure.
+          if ! printf '%s\n' "$TAGS" | grep -Fxq "$IMAGE_REF"; then
+            echo "::error::resolved image-ref '$IMAGE_REF' is not among the pushed tags:"
+            printf '%s\n' "$TAGS"
+            exit 1
+          fi
+
           echo "image-ref=$IMAGE_REF" >> "$GITHUB_OUTPUT"
-          echo "Built: $IMAGE_REF"
+          echo "Built:  $IMAGE_REF"
+          echo "Digest: $DIGEST"
