@@ -56,6 +56,20 @@ on:
           build. Image push to GHCR uses the workflow's GITHUB_TOKEN with the
           calling job's `permissions: packages: write`.
         required: false
+      maxmind-license-key:
+        description: |
+          MaxMind licence key, mounted into the build as the BuildKit secret
+          `maxmind-license-key` so a Dockerfile can download a GeoLite2
+          database at build time:
+
+            RUN --mount=type=secret,id=maxmind-license-key ...
+
+          Optional. The secret file is ALWAYS mounted - empty when this isn't
+          passed - so a Dockerfile that uses it can branch on an empty key and
+          build without the database rather than failing. Never use a
+          build-arg for this: build args are recorded in the image history and
+          readable via `docker history`.
+        required: false
 
 permissions:
   contents: read
@@ -90,6 +104,13 @@ jobs:
           //npm.pkg.github.com/:_authToken=${{ secrets.ghcr-read-token || secrets.GITHUB_TOKEN }}
           EOF
 
+      # Written unconditionally so `secret-files` below can reference it in
+      # every build. An absent key yields an empty file, which a consuming
+      # Dockerfile is expected to treat as "skip the download".
+      - name: Compose MaxMind licence key file for build-time GeoIP download
+        run: |
+          printf '%s' '${{ secrets.maxmind-license-key }}' > /tmp/build-maxmind-key
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -119,6 +140,7 @@ jobs:
           # The secret is only mounted for that RUN; never written to a layer.
           secret-files: |
             npmrc=/tmp/build-npmrc
+            maxmind-license-key=/tmp/build-maxmind-key
 
       - name: Resolve image-ref
         id: ref
